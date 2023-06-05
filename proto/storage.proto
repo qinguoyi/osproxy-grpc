@@ -1,0 +1,296 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = "github.com/qinguoyi/ObjectStorageProxy/proto";
+// 导入google/api/annotations.proto
+import "google/api/annotations.proto";
+import "google/protobuf/descriptor.proto";
+// message中的数字序号必须是连续的，且必须从1开始递增。这是由于这些数字序号用来标识每个message在二进制编码和解码过程中的位置，因此必须是唯一的和有序的
+// HealthCheck 健康检查
+service HealthCheck {
+  rpc PingHandler (NULLRequest) returns (HelloResponse) {
+    option (google.api.http) = {
+      get: "/api/storage/rpc/ping",
+    };
+  }
+  rpc HealthCheckHandler(NULLRequest) returns(HelloResponse){
+    option (google.api.http) = {
+      get: "/api/storage/rpc/health",
+    };
+  }
+}
+
+message NULLRequest{
+}
+
+// Greeter 测试
+service Greeter {
+  rpc SayHello (HelloRequest) returns (HelloResponse) {
+    // 这里添加了google.api.http注释
+    option (google.api.http) = {
+      post: "/v1/example/echo",
+      body: "*",
+    };
+  }
+}
+
+
+message HelloRequest{
+  string name = 1;
+}
+
+message HelloReply{
+  string res = 1;
+}
+
+message HelloResponse{
+  int32 code = 1;
+  string message = 2;
+  HelloReply data = 3;
+}
+
+// Link .
+service Link{
+  rpc UploadLinkHandler(GenUploadReq) returns(GenUploadResp){
+    option (google.api.http) = {
+      post: "/api/storage/rpc/link/upload",
+      body: "*",
+    };
+  }
+  rpc DownloadLinkHandler(GenDownloadReq) returns(GenDownloadResp){
+    option (google.api.http) = {
+      post: "/api/storage/rpc/link/download",
+      body: "*",
+    };
+  }
+}
+
+message GenUploadReq{
+  repeated string filePath = 1;
+  int32 expire = 2;
+}
+
+message MultiUrlResult {
+  string upload = 1;
+  string merge = 2;
+}
+
+message UrlResult{
+  string single = 1;
+  MultiUrlResult multi = 2;
+}
+message GenUpload{
+  string uid = 1;
+  UrlResult url = 2;
+  string path = 3;
+  string date = 4;
+  string expire = 5;
+  string signature = 6;
+}
+
+message GenUploadResp{
+  int32 code = 1;
+  string message = 2;
+  repeated GenUpload data = 3;
+}
+
+message GenDownloadReq{
+  repeated string uid = 1;
+  int32 expire = 2;
+}
+
+message MetaInfo{
+  string srcName = 1;
+  string dstName = 2;
+  int32 height = 3;
+  int32 width = 4;
+  string md5 = 5;
+  string size = 6;
+}
+
+message GenDownload{
+  string uid = 1;
+  string url = 2;
+  MetaInfo meta = 3;
+  string bucket = 4;
+  string object = 5;
+  string date = 6;
+  string expire = 7;
+  string signature = 8;
+}
+
+message GenDownloadResp{
+  int32 code = 1;
+  string message = 2;
+  repeated GenDownload data = 3;
+}
+
+// Resume .
+service Resume {
+  rpc ResumeHandler(ResumeReq) returns(ResumeResp){
+    option (google.api.http) = {
+      post: "/api/storage/rpc/resume",
+      body: "*",
+    };
+  }
+}
+
+message MD5Name{
+  string md5 = 1;
+  string path = 2;
+}
+
+message ResumeReq {
+  repeated MD5Name data = 3;
+}
+
+message ResumeInfo{
+  string md5 = 1;
+  string uid = 2;
+}
+
+message ResumeResp{
+  int32 code = 1;
+  string message = 2;
+  repeated ResumeInfo data = 3;
+}
+
+// Proxy .
+service Proxy{
+  rpc ProxyHandler(ProxyReq) returns(ProxyResp){
+    option(google.api.http) = {
+      get: "/api/storage/rpc/proxy",
+    };
+  }
+}
+message ProxyReq{
+  string uid = 1;
+}
+
+message ProxyResp{
+  int32 code = 1;
+  string message = 2;
+  string  data = 3;
+}
+
+
+// CheckPoint .
+service CheckPoint{
+  rpc CheckPointHandler(CPReq) returns(CPResp){
+    option(google.api.http) = {
+      get: "/api/storage/rpc/checkpoint/{uid}",
+    };
+  }
+}
+
+message CPReq{
+  string uid = 1;
+}
+
+message CPResp{
+  int32 code = 1;
+  string message = 2;
+  repeated int32 data = 3;
+}
+
+// Download .
+service Download{
+  rpc DownloadHandler(DownloadReq) returns(stream DownloadResp){
+    option(google.api.http) = {
+      get: "/api/storage/rpc/download/example",
+    };
+  }
+}
+
+message DownloadReq{
+  string uid = 1;
+  string name = 2;
+  string online = 3;
+  string date = 4;
+  string expire = 5;
+  string bucket = 6;
+  string object = 7;
+  string signature = 8;
+}
+
+message DownloadResp{
+  bytes data = 1;
+}
+
+service Upload{
+  rpc UploadSingleHandler(stream UploadSingleReq) returns(UploadSingleResp){
+    // 仅仅是swag展示
+    option(google.api.http) = {
+      put: "/api/storage/rpc/upload/example",
+      body:"file",
+    };
+  }
+  rpc UploadSingleProxyHandler(stream UploadSingleReq) returns(UploadSingleResp){
+    // 仅仅是swag展示
+    option(google.api.http) = {
+      put: "/api/storage/rpc/upload/proxy",
+      body:"file",
+    };
+  }
+  rpc UploadMultiPartHandler(stream UploadMultiReq) returns(UploadMultiResp){
+    // 仅仅是swag展示
+    option(google.api.http) = {
+      put: "/api/storage/rpc/upload/multi/example",
+      body:"file",
+    };
+  }
+  rpc UploadMergeHandler(UploadMergeReq) returns(UploadMergeResp){
+    // 这里如果是get，则会将UploadMergeReq展示为查询参数，post/put必须有body才行。但，仅仅是swager展示有问题，实际上参数还是会传递的
+    option(google.api.http) = {
+      put: "/api/storage/rpc/upload/merge"
+    };
+  }
+}
+
+message UploadSingleReq{
+  string uid = 1;
+  bytes file = 2;
+  string md5 = 3;
+  string date = 4;
+  string expire = 5;
+  string signature = 6;
+}
+
+message UploadSingleResp{
+  int32 code = 1;
+  string message = 2;
+  string data = 3;
+}
+
+message UploadMultiReq{
+  string uid = 1;
+  bytes file = 2;
+  string md5 = 3;
+  string date = 4;
+  string expire = 5;
+  string signature = 6;
+  string chunk_num = 7;
+}
+
+message UploadMultiResp{
+  int32 code = 1;
+  string message = 2;
+  string data = 3;
+}
+
+message UploadMergeReq{
+  string uid = 1;
+  string md5 = 2;
+  string date = 3;
+  string expire = 4;
+  string signature = 5;
+  string num = 6;
+  string size = 7;
+}
+
+message UploadMergeResp{
+  int32 code = 1;
+  string message = 2;
+  string data = 3;
+}
