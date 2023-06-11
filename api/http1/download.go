@@ -120,6 +120,8 @@ func DownloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ch := make(chan []byte, 1024*1024*20)
+	// 判断是否在本地
+
 	if !meta.MultiPart {
 		go func() {
 			step := int64(1 * 1024 * 1024)
