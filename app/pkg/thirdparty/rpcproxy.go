@@ -183,3 +183,41 @@ func (s *storageRPCService) MergeForward(target string, req *proto.UploadMergeRe
 	resp, err := client.UploadMergeHandler(context.Background(), req)
 	return resp, err
 }
+
+// DownloadForward .
+func (s *storageRPCService) DownloadForward(target string, req *proto.DownloadReq) (proto.Download_DownloadHandlerClient, error) {
+	clientConn := base.NewRPCClient(target)
+	client := proto.NewDownloadClient(clientConn)
+	stream, err := client.DownloadHandler(context.Background(),
+		&proto.DownloadReq{
+			Uid:       req.Uid,
+			Name:      req.Name,
+			Online:    req.Online,
+			Date:      req.Date,
+			Expire:    req.Expire,
+			Bucket:    req.Bucket,
+			Object:    req.Object,
+			Signature: req.Signature,
+		})
+	return stream, err
+}
+
+// DownloadWebForward .
+func (s *storageRPCService) DownloadWebForward(target string, r *http.Request) (proto.Download_DownloadHandlerClient, error) {
+	clientConn := base.NewRPCClient(target)
+	client := proto.NewDownloadClient(clientConn)
+	query := r.URL.Query()
+	stream, err := client.DownloadHandler(
+		context.Background(),
+		&proto.DownloadReq{
+			Uid:       base.Query(query, "uid"),
+			Name:      base.Query(query, "name"),
+			Online:    base.Query(query, "online"),
+			Date:      base.Query(query, "date"),
+			Expire:    base.Query(query, "expire"),
+			Bucket:    base.Query(query, "bucket"),
+			Object:    base.Query(query, "object"),
+			Signature: base.Query(query, "signature"),
+		})
+	return stream, err
+}
