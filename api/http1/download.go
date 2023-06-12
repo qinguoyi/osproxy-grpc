@@ -9,11 +9,16 @@ import (
 	"github.com/qinguoyi/ObjectStorageProxy/app/pkg/base"
 	"github.com/qinguoyi/ObjectStorageProxy/app/pkg/repo"
 	"github.com/qinguoyi/ObjectStorageProxy/app/pkg/storage"
+	"github.com/qinguoyi/ObjectStorageProxy/app/pkg/thirdparty"
 	"github.com/qinguoyi/ObjectStorageProxy/app/pkg/utils"
 	"github.com/qinguoyi/ObjectStorageProxy/bootstrap"
 	"github.com/qinguoyi/ObjectStorageProxy/bootstrap/plugins"
+	"github.com/qinguoyi/ObjectStorageProxy/proto"
 	"io"
 	"net/http"
+	"os"
+	"path"
+	"sync"
 	"time"
 )
 
@@ -121,144 +126,220 @@ func DownloadHandler(w http.ResponseWriter, r *http.Request) {
 
 	ch := make(chan []byte, 1024*1024*20)
 	// 判断是否在本地
-
-	if !meta.MultiPart {
-		go func() {
-			step := int64(1 * 1024 * 1024)
-			for {
-				if start >= end {
-					close(ch)
-					break
-				}
-				length := step
-				if start+length > end {
-					length = end - start + 1
-				}
-				data, err := storage.NewStorage().Storage.GetObject(bucketName, objectName, start, length)
-				if err != nil && err != io.EOF {
-					lgLogger.Logger.Error(fmt.Sprintf("从对象存储获取数据失败%s", err.Error()))
-				}
-				ch <- data
-				start += step
-			}
-		}()
-
-		// 这种场景，会先从minio中获取全部数据，再流式传输，所以下载前会等待一下，但会把内存打爆
-		//go func() {
-		//	data, err := inner.NewStorage().Storage.GetObject(bucketName, objectName, start, end-start+1)
-		//	if err != nil && err != io.EOF {
-		//		lgLogger.WithContext(c).Error(fmt.Sprintf("从minio获取数据失败%s", err.Error()))
-		//	}
-		//	ch <- data
-		//	close(ch)
-		//}()
-
-	} else {
-		// 分片数据传输
-		var multiPartInfoList []models.MultiPartInfo
-		val, err := lgRedis.Get(context.Background(), fmt.Sprintf("%s-multiPart", uidStr)).Result()
-		// key在redis中不存在
-		if err == redis.Nil {
-			lgDB := new(plugins.LangGoDB).Use("default").NewDB()
-			if err := lgDB.Model(&models.MultiPartInfo{}).Where(
-				"storage_uid = ? and status = ?", uid, 1).Order("chunk_num ASC").Find(&multiPartInfoList).Error; err != nil {
-				lgLogger.Logger.Error("下载数据，查询分片数据失败")
-				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = w.Write([]byte("内部异常"))
-				return
-			}
-			// 写入redis
-			lgRedis := new(plugins.LangGoRedis).NewRedis()
-			b, err := json.Marshal(multiPartInfoList)
-			if err != nil {
-				lgLogger.Logger.Warn("数据分片信息写入redis失败")
-			}
-			lgRedis.SetNX(context.Background(), fmt.Sprintf("%s-multiPart", uidStr), b, 5*60*time.Second)
-		} else {
-			if err != nil {
-				lgLogger.Logger.Error("下载数据，查询redis失败")
-				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = w.Write([]byte("内部异常"))
-				return
-			}
-			var msg []models.MultiPartInfo
-			if err := json.Unmarshal([]byte(val), &msg); err != nil {
-				lgLogger.Logger.Error("下载数据，查询reids，结果序列化失败")
-				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = w.Write([]byte("内部异常"))
-				return
-			}
-			// 续期
-			lgRedis.Expire(context.Background(), fmt.Sprintf("%s-multiPart", uidStr), 5*60*time.Second)
-			multiPartInfoList = msg
+	proxyFlag := false
+	if bootstrap.NewConfig("").Local.Enabled {
+		dirName := path.Join(utils.LocalStore, uidStr)
+		if _, err := os.Stat(dirName); os.IsNotExist(err) {
+			proxyFlag = true
 		}
-		if meta.PartNum != len(multiPartInfoList) {
-			lgLogger.Logger.Error("分片数量和整体数量不一致")
+	}
+	if proxyFlag {
+		// 不在本地，询问集群内其他服务并转发
+		serviceList, err := base.NewServiceRegister().Discovery()
+		if err != nil || serviceList == nil {
+			lgLogger.Logger.Error("发现其他服务失败")
 			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte("分片数量和整体数量不一致"))
+			_, _ = w.Write([]byte("发现其他服务失败"))
+			return
+		}
+		var wg sync.WaitGroup
+		var ipList []string
+		ipChan := make(chan string, len(serviceList))
+		for _, service := range serviceList {
+			wg.Add(1)
+			go func(ip string, port string, ipChan chan string, wg *sync.WaitGroup) {
+				defer wg.Done()
+				res, err := thirdparty.NewStorageRPCService().Locate(
+					fmt.Sprintf("%s:%s", ip, bootstrap.NewConfig("").App.Port),
+					&proto.ProxyReq{Uid: uidStr},
+				)
+				if err != nil || res == nil {
+					lgLogger.Logger.Error(fmt.Sprintf("转发失败,%s", err.Error()))
+					return
+				}
+				ipChan <- res.Data
+			}(service.IP, service.Port, ipChan, &wg)
+		}
+		wg.Wait()
+		close(ipChan)
+		for re := range ipChan {
+			ipList = append(ipList, re)
+		}
+		if len(ipList) == 0 {
+			lgLogger.Logger.Error("发现其他服务失败")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("发现其他服务失败"))
+			return
+		}
+		proxyIP := ipList[0]
+		resp, err := thirdparty.NewStorageRPCService().DownloadWebForward(
+			fmt.Sprintf("%s:%s", proxyIP, bootstrap.NewConfig("").App.Port),
+			r,
+		)
+		if err != nil {
+			lgLogger.Logger.Error(fmt.Sprintf("转发失败,%s", err.Error()))
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("转发失败"))
 			return
 		}
 
-		// 查找起始分片
-		index, totalSize := int64(0), int64(0)
-		var startP, lengthP int64
 		for {
-			if totalSize >= start {
-				startP, lengthP = 0, multiPartInfoList[index].StorageSize
-			} else {
-				if totalSize+multiPartInfoList[index].StorageSize > start {
-					startP, lengthP = start-totalSize, multiPartInfoList[index].StorageSize-(start-totalSize)
-				} else {
-					totalSize += multiPartInfoList[index].StorageSize
-					index++
-					continue
-				}
+			// 从服务器返回的数据流中读取数据
+			fileData, err := resp.Recv()
+			if err == io.EOF {
+				close(ch)
+				break
 			}
-			break
-		}
-		var chanSlice []chan int
-		for i := 0; i < utils.MultiPartDownload; i++ {
-			chanSlice = append(chanSlice, make(chan int, 1))
-		}
 
-		chanSlice[0] <- 1
-		j := 0
-		for i := 0; i < utils.MultiPartDownload; i++ {
-			go func(i int, startP_, lengthP_ int64) {
+			if err != nil {
+				lgLogger.Logger.Error(fmt.Sprintf("转发失败，详情：%s", err.Error()))
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte("转发失败"))
+				return
+			}
+
+			// 将数据写入channel
+			ch <- fileData.GetData()
+		}
+	} else {
+		if !meta.MultiPart {
+			go func() {
+				step := int64(1 * 1024 * 1024)
 				for {
-					// 当前块计算完后，需要等待前一个块合并到主哈希
-					<-chanSlice[i]
-
-					if index >= int64(meta.PartNum) {
+					if start >= end {
 						close(ch)
 						break
 					}
-					if totalSize >= start {
-						startP_, lengthP_ = 0, multiPartInfoList[index].StorageSize
+					length := step
+					if start+length > end {
+						length = end - start + 1
 					}
-					totalSize += multiPartInfoList[index].StorageSize
-
-					data, err := storage.NewStorage().Storage.GetObject(
-						multiPartInfoList[index].Bucket,
-						multiPartInfoList[index].StorageName,
-						startP_,
-						lengthP_,
-					)
+					data, err := storage.NewStorage().Storage.GetObject(bucketName, objectName, start, length)
 					if err != nil && err != io.EOF {
 						lgLogger.Logger.Error(fmt.Sprintf("从对象存储获取数据失败%s", err.Error()))
 					}
-					// 合并到主哈希
 					ch <- data
-					index++
-					// 这里要注意适配chanSlice的长度
-					if j == utils.MultiPartDownload-1 {
-						j = 0
-					} else {
-						j++
-					}
-					chanSlice[j] <- 1
+					start += step
 				}
-			}(i, startP, lengthP)
+			}()
+
+			// 这种场景，会先从minio中获取全部数据，再流式传输，所以下载前会等待一下，但会把内存打爆
+			//go func() {
+			//	data, err := inner.NewStorage().Storage.GetObject(bucketName, objectName, start, end-start+1)
+			//	if err != nil && err != io.EOF {
+			//		lgLogger.WithContext(c).Error(fmt.Sprintf("从minio获取数据失败%s", err.Error()))
+			//	}
+			//	ch <- data
+			//	close(ch)
+			//}()
+
+		} else {
+			// 分片数据传输
+			var multiPartInfoList []models.MultiPartInfo
+			val, err := lgRedis.Get(context.Background(), fmt.Sprintf("%s-multiPart", uidStr)).Result()
+			// key在redis中不存在
+			if err == redis.Nil {
+				lgDB := new(plugins.LangGoDB).Use("default").NewDB()
+				if err := lgDB.Model(&models.MultiPartInfo{}).Where(
+					"storage_uid = ? and status = ?", uid, 1).Order("chunk_num ASC").Find(&multiPartInfoList).Error; err != nil {
+					lgLogger.Logger.Error("下载数据，查询分片数据失败")
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte("内部异常"))
+					return
+				}
+				// 写入redis
+				lgRedis := new(plugins.LangGoRedis).NewRedis()
+				b, err := json.Marshal(multiPartInfoList)
+				if err != nil {
+					lgLogger.Logger.Warn("数据分片信息写入redis失败")
+				}
+				lgRedis.SetNX(context.Background(), fmt.Sprintf("%s-multiPart", uidStr), b, 5*60*time.Second)
+			} else {
+				if err != nil {
+					lgLogger.Logger.Error("下载数据，查询redis失败")
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte("内部异常"))
+					return
+				}
+				var msg []models.MultiPartInfo
+				if err := json.Unmarshal([]byte(val), &msg); err != nil {
+					lgLogger.Logger.Error("下载数据，查询reids，结果序列化失败")
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte("内部异常"))
+					return
+				}
+				// 续期
+				lgRedis.Expire(context.Background(), fmt.Sprintf("%s-multiPart", uidStr), 5*60*time.Second)
+				multiPartInfoList = msg
+			}
+			if meta.PartNum != len(multiPartInfoList) {
+				lgLogger.Logger.Error("分片数量和整体数量不一致")
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte("分片数量和整体数量不一致"))
+				return
+			}
+
+			// 查找起始分片
+			index, totalSize := int64(0), int64(0)
+			var startP, lengthP int64
+			for {
+				if totalSize >= start {
+					startP, lengthP = 0, multiPartInfoList[index].StorageSize
+				} else {
+					if totalSize+multiPartInfoList[index].StorageSize > start {
+						startP, lengthP = start-totalSize, multiPartInfoList[index].StorageSize-(start-totalSize)
+					} else {
+						totalSize += multiPartInfoList[index].StorageSize
+						index++
+						continue
+					}
+				}
+				break
+			}
+			var chanSlice []chan int
+			for i := 0; i < utils.MultiPartDownload; i++ {
+				chanSlice = append(chanSlice, make(chan int, 1))
+			}
+
+			chanSlice[0] <- 1
+			j := 0
+			for i := 0; i < utils.MultiPartDownload; i++ {
+				go func(i int, startP_, lengthP_ int64) {
+					for {
+						// 当前块计算完后，需要等待前一个块合并到主哈希
+						<-chanSlice[i]
+
+						if index >= int64(meta.PartNum) {
+							close(ch)
+							break
+						}
+						if totalSize >= start {
+							startP_, lengthP_ = 0, multiPartInfoList[index].StorageSize
+						}
+						totalSize += multiPartInfoList[index].StorageSize
+
+						data, err := storage.NewStorage().Storage.GetObject(
+							multiPartInfoList[index].Bucket,
+							multiPartInfoList[index].StorageName,
+							startP_,
+							lengthP_,
+						)
+						if err != nil && err != io.EOF {
+							lgLogger.Logger.Error(fmt.Sprintf("从对象存储获取数据失败%s", err.Error()))
+						}
+						// 合并到主哈希
+						ch <- data
+						index++
+						// 这里要注意适配chanSlice的长度
+						if j == utils.MultiPartDownload-1 {
+							j = 0
+						} else {
+							j++
+						}
+						chanSlice[j] <- 1
+					}
+				}(i, startP, lengthP)
+			}
 		}
 	}
 
@@ -283,7 +364,7 @@ func DownloadHandler(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-clientGone:
-			lgLogger.Logger.Error("发送stream出错1")
+			lgLogger.Logger.Error("发送stream出错")
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte("内部异常"))
 			return
