@@ -1,6 +1,6 @@
 ## 简介
 
-`osproxy-grpc`是[osproxy](https://github.com/qinguoyi/osproxy)的rpc实现，可以作为文件存储微服务，包括但不限于以下功能：
+`osproxy-grpc`是[osproxy](https://github.com/qinguoyi/osproxy)的rpc实现，可以作为文件存储微服务，文件会在服务中转处理后再对接到对象存储，包括但不限于以下功能：
 
 * 多调用方式，支持rpc和api两种调用及测试
 * 分布式uid及秒传，支持相同文件不同命名
